@@ -6,9 +6,13 @@ const state = {
   // 展示中的结果：{ key, data }。key 为求解时刻的输入指纹，
   // 仅当 key 与当前输入指纹一致时结果才属于当前页面，否则一律撤下。
   result: null,
-  // 求解请求序号：每次求解与每次方案切换（新建/打开/删除当前方案）都递增，
-  // 响应回来时序号不匹配即为过期请求，静默丢弃。
+  // 请求归属序号：每次求解、每次方案切换（新建/打开/删除当前方案）以及
+  // 输入编辑使在途求解失效时都递增；响应回来时序号不匹配即为过期请求，
+  // 静默丢弃。
   solveSeq: 0,
+  // 在途求解请求的输入指纹；null 表示当前无在途求解。输入一旦变化，
+  // 不必等响应回来即可作废该请求并释放求解按钮。
+  pendingKey: null,
   planMenuOpen: false,
 };
 
@@ -105,9 +109,17 @@ function renderMics() {
     });
 
     const candArea = card.querySelector('[data-k="candidates"]');
+    // 键入即提交草稿（不等失焦）：plan 始终与界面一致，指纹随键入变化，
+    // 旧结果立即撤下、在途求解立即失效
+    candArea.addEventListener("input", () => {
+      mic.candidates = parseCandidates(candArea.value).values;
+      card.querySelector(".cand-count").textContent =
+        `${mic.candidates.length}/12`;
+      onPlanEdited();
+    });
+    // 失焦时规整：清理失效的现用频点并重建卡片（刷新下拉框与计数）
     candArea.addEventListener("change", () => {
-      const parsed = parseCandidates(candArea.value);
-      mic.candidates = parsed.values;
+      mic.candidates = parseCandidates(candArea.value).values;
       if (mic.current != null && !mic.candidates.includes(mic.current)) {
         mic.current = null;
       }
@@ -162,12 +174,14 @@ function renderBands() {
       <span>kHz</span>
       <button class="btn btn-small btn-danger" data-act="delband">×</button>`;
     const [lo, hi] = chip.querySelectorAll("input");
-    lo.addEventListener("change", () => {
-      plan.forbidden[idx].low = parseInt(lo.value, 10);
+    // 键入即提交（input 而非 change）：plan 立即与界面一致，
+    // 旧结果与在途求解随指纹变化立即失效
+    lo.addEventListener("input", () => {
+      b.low = parseInt(lo.value, 10);
       onPlanEdited();
     });
-    hi.addEventListener("change", () => {
-      plan.forbidden[idx].high = parseInt(hi.value, 10);
+    hi.addEventListener("input", () => {
+      b.high = parseInt(hi.value, 10);
       onPlanEdited();
     });
     chip.querySelector('[data-act="delband"]').addEventListener("click", () => {
@@ -192,12 +206,16 @@ function collectPlan() {
 // --------------------------- 结果归属规则 ---------------------------
 //
 // 结果只属于“产生它的那份输入”：
+//   * 控件草稿键入（input 事件）即写回 plan，不等失焦——plan 始终与
+//     界面一致，求解/保存不会悄悄使用与界面不符的旧值；
 //   * 求解时记录输入指纹 reqKey 与请求序号 reqId；
 //   * 响应（无论成功/失败）回来时，reqId 仍是最新且当前输入指纹仍等于
 //     reqKey，结果才允许上屏，否则静默丢弃；
-//   * 任何输入变动都会改变指纹，onPlanEdited() 立即撤下失效结果；
-//   * 新建/打开/删除当前方案会递增 solveSeq 并清空结果，在途的旧请求
-//     响应随之全部过期。
+//   * 任何输入变动都会改变指纹，onPlanEdited() 立即撤下失效结果，并作废
+//     在途求解（递增 solveSeq），其迟到响应随之过期；
+//   * 新建/打开/删除当前方案会递增 solveSeq 并清空结果；打开请求在发起
+//     那一刻即切换上下文，等待期内到达的旧响应一律过期，读取失败保留
+//     当前编辑内容。
 // 指纹只含影响求解与展示的字段（方案名称不影响协调结果，不计入）。
 
 function planFingerprint() {
@@ -225,10 +243,19 @@ function invalidateResult() {
   clearCanvas();
 }
 
-// 任何编辑动作后调用：展示中的结果若不再对应当前输入，立即撤下。
+// 任何编辑动作后调用（控件键入即触发，不等失焦）：
+//   * 展示中的结果若不再对应当前输入，立即撤下；
+//   * 在途求解的输入已变化时，立即作废该请求并复位求解按钮——
+//     迟到的响应随请求序号过期被静默丢弃，用户可立刻重新求解。
 function onPlanEdited() {
-  if (state.result && state.result.key !== planFingerprint()) {
+  const fp = planFingerprint();
+  if (state.result && state.result.key !== fp) {
     invalidateResult();
+  }
+  if (state.pendingKey !== null && state.pendingKey !== fp) {
+    state.pendingKey = null;
+    state.solveSeq++;
+    setSolveBusy(false);
   }
 }
 
@@ -242,6 +269,7 @@ function setSolveBusy(busy) {
 // 作废旧求解请求、撤下旧结果、复位求解按钮。
 function switchPlanContext() {
   state.solveSeq++;
+  state.pendingKey = null;
   invalidateResult();
   setSolveBusy(false);
 }
@@ -292,6 +320,7 @@ async function solvePlan() {
   }
   const reqId = ++state.solveSeq;
   const reqKey = planFingerprint();
+  state.pendingKey = reqKey;
   const payload = toApiPayload(plan);
   // 归属判定：仍是最后一次求解、且输入自提交起未变，响应才属于当前页面
   const isCurrent = () =>
@@ -315,8 +344,11 @@ async function solvePlan() {
     if (!isCurrent()) return; // 过期失败响应：不得报错
     toast("求解失败：" + e.message, true);
   } finally {
-    // 仅在仍是当前请求时复位按钮；过期请求的收尾不得干扰新上下文
-    if (reqId === state.solveSeq) setSolveBusy(false);
+    // 仅在仍是当前请求时收尾；过期请求的收尾不得干扰新上下文
+    if (reqId === state.solveSeq) {
+      state.pendingKey = null;
+      setSolveBusy(false);
+    }
   }
 }
 
@@ -665,10 +697,15 @@ async function togglePlanMenu() {
 }
 
 async function loadPlan(id) {
+  // 发起打开请求的那一刻即切换方案上下文：作废旧求解、撤下旧结果，
+  // 等待期内到达的旧响应一律过期；读取失败也不会动当前编辑内容。
+  switchPlanContext();
+  const reqId = state.solveSeq;
   try {
     const resp = await fetch(`/api/plans/${id}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const rec = await resp.json();
+    if (reqId !== state.solveSeq) return; // 过期成功响应：不得回填
     const d = rec.plan;
     plan = {
       name: d.name,
@@ -684,12 +721,12 @@ async function loadPlan(id) {
       })),
     };
     state.planId = rec.id;
-    switchPlanContext();
     syncFormFromPlan();
     $("#planMenu").hidden = true;
     state.planMenuOpen = false;
     toast(`已打开方案「${rec.name}」`);
   } catch (e) {
+    if (reqId !== state.solveSeq) return; // 过期失败响应：不得报错
     toast("打开失败：" + e.message, true);
   }
 }
@@ -778,9 +815,12 @@ function init() {
     }
   });
   window.addEventListener("resize", () => {
-    // 缩放只重绘仍属于当前输入的结果；指纹不匹配时先撤下，避免新旧混绘
+    // 缩放只重绘仍属于当前输入的结果；指纹不匹配时先撤下，避免新旧混绘。
+    // 冲突结果没有 assignment（频谱已在展示时清空），不重绘。
     onPlanEdited();
-    if (state.result) drawSpectrum(plan, state.result.data);
+    if (state.result && Array.isArray(state.result.data.assignment)) {
+      drawSpectrum(plan, state.result.data);
+    }
   });
 }
 
