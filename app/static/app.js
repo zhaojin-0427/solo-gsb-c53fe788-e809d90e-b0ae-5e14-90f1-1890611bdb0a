@@ -6,8 +6,8 @@ const state = {
   // 展示中的结果：{ key, data }。key 为求解时刻的输入指纹，
   // 仅当 key 与当前输入指纹一致时结果才属于当前页面，否则一律撤下。
   result: null,
-  // 求解请求序号：每次求解与每次方案切换（新建/打开/删除当前方案）都递增，
-  // 响应回来时序号不匹配即为过期请求，静默丢弃。
+  // 求解请求序号：每次求解、每次编辑输入、每次方案切换（新建/打开/删除
+  // 当前方案）都递增，响应回来时序号不匹配即为过期请求，静默丢弃。
   solveSeq: 0,
   planMenuOpen: false,
 };
@@ -104,16 +104,24 @@ function renderMics() {
       onPlanEdited();
     });
 
+    // 候选频点为“控件草稿”：每次键入都即时解析入 plan（不重绘，避免输入中
+    // 丢焦点），保证指纹、求解与保存读到的永远是界面上的最新值；
+    // 失焦（change）时再重绘，规范化下拉项、计数等派生展示。
     const candArea = card.querySelector('[data-k="candidates"]');
-    candArea.addEventListener("change", () => {
+    const commitCandidates = (rebuild) => {
       const parsed = parseCandidates(candArea.value);
       mic.candidates = parsed.values;
       if (mic.current != null && !mic.candidates.includes(mic.current)) {
         mic.current = null;
+        // 键入过程中不重绘，但要让现用频点下拉与 plan 保持一致，避免界面
+        // 仍选中一个已不在候选中的旧值。
+        card.querySelector('[data-k="current"]').value = "";
       }
-      renderMics();
+      if (rebuild) renderMics();
       onPlanEdited();
-    });
+    };
+    candArea.addEventListener("input", () => commitCandidates(false));
+    candArea.addEventListener("change", () => commitCandidates(true));
 
     card.querySelector('[data-k="current"]').addEventListener("change", (e) => {
       mic.current = e.target.value === "" ? null : parseInt(e.target.value, 10);
@@ -156,20 +164,24 @@ function renderBands() {
     const chip = document.createElement("span");
     chip.className = "band-chip";
     chip.innerHTML = `
-      <input type="number" min="1" step="1" value="${b.low}" title="下限（含）">
+      <input type="number" min="1" step="1" value="${b.low ?? ""}" title="下限（含）">
       <span>～</span>
-      <input type="number" min="1" step="1" value="${b.high}" title="上限（含）">
+      <input type="number" min="1" step="1" value="${b.high ?? ""}" title="上限（含）">
       <span>kHz</span>
       <button class="btn btn-small btn-danger" data-act="delband">×</button>`;
     const [lo, hi] = chip.querySelectorAll("input");
-    lo.addEventListener("change", () => {
-      plan.forbidden[idx].low = parseInt(lo.value, 10);
+    // 禁用区间上下限同样键入即写入 plan：输入一发生指纹即变，
+    // 旧结果立即撤下、在途求解随之失效；空值等非法草稿留待校验时报错，
+    // 绝不静默使用重绘出的旧值。
+    const commitBand = (field, input) => {
+      const n = parseInt(input.value, 10);
+      plan.forbidden[idx][field] = Number.isNaN(n) ? null : n;
       onPlanEdited();
-    });
-    hi.addEventListener("change", () => {
-      plan.forbidden[idx].high = parseInt(hi.value, 10);
-      onPlanEdited();
-    });
+    };
+    lo.addEventListener("input", () => commitBand("low", lo));
+    lo.addEventListener("change", () => commitBand("low", lo));
+    hi.addEventListener("input", () => commitBand("high", hi));
+    hi.addEventListener("change", () => commitBand("high", hi));
     chip.querySelector('[data-act="delband"]').addEventListener("click", () => {
       plan.forbidden.splice(idx, 1);
       renderBands();
@@ -195,9 +207,12 @@ function collectPlan() {
 //   * 求解时记录输入指纹 reqKey 与请求序号 reqId；
 //   * 响应（无论成功/失败）回来时，reqId 仍是最新且当前输入指纹仍等于
 //     reqKey，结果才允许上屏，否则静默丢弃；
-//   * 任何输入变动都会改变指纹，onPlanEdited() 立即撤下失效结果；
-//   * 新建/打开/删除当前方案会递增 solveSeq 并清空结果，在途的旧请求
-//     响应随之全部过期。
+//   * 任何输入变动（包括候选频点文本框、禁用区间上下限等键入中尚未失焦的
+//     控件草稿，草稿在每次 input 事件即时入 plan）都会改变指纹：
+//     onPlanEdited() 立即撤下失效结果、递增 solveSeq 作废旧求解并解锁按钮；
+//   * 打开另一方案的 GET 发起时即递增 solveSeq 并撤下结果，读取失败保留
+//     当前方案的编辑内容；过期的打开响应（成功/失败）既不回填也不报错；
+//   * 新建/删除当前方案同样递增 solveSeq 并清空结果，在途旧请求全部过期。
 // 指纹只含影响求解与展示的字段（方案名称不影响协调结果，不计入）。
 
 function planFingerprint() {
@@ -225,11 +240,19 @@ function invalidateResult() {
   clearCanvas();
 }
 
-// 任何编辑动作后调用：展示中的结果若不再对应当前输入，立即撤下。
+// 当前展示中的结果是否仍对应当前输入（窗口缩放等非编辑动作也可安全调用）。
+function resultStillCurrent() {
+  return !state.result || state.result.key === planFingerprint();
+}
+
+// 任何编辑动作后调用：
+//   1. 展示中的结果若不再对应当前输入，立即从结果表与频谱撤下；
+//   2. 递增求解序号，使任何在途求解（含迟到的成功/失败响应）立即失效；
+//   3. 解除“求解中”按钮锁定，允许立刻以新输入重新求解。
 function onPlanEdited() {
-  if (state.result && state.result.key !== planFingerprint()) {
-    invalidateResult();
-  }
+  if (!resultStillCurrent()) invalidateResult();
+  state.solveSeq++;
+  setSolveBusy(false);
 }
 
 function setSolveBusy(busy) {
@@ -238,7 +261,7 @@ function setSolveBusy(busy) {
   btn.textContent = busy ? "求解中…" : "▶ 协调求解";
 }
 
-// 方案上下文切换（新建/打开/删除当前方案）：
+// 方案上下文切换（新建/删除当前方案；打开方案在请求发起时自行处理）：
 // 作废旧求解请求、撤下旧结果、复位求解按钮。
 function switchPlanContext() {
   state.solveSeq++;
@@ -665,10 +688,19 @@ async function togglePlanMenu() {
 }
 
 async function loadPlan(id) {
+  // 请求一发出即切换上下文：递增求解序号使任何在途旧求解立即失效，
+  // 撤下旧结果并复位求解按钮。此时还未改动 plan —— 若读取失败，
+  // 用户正在编辑的原方案内容原样保留。
+  const reqId = ++state.solveSeq;
+  invalidateResult();
+  setSolveBusy(false);
+  let resp;
   try {
-    const resp = await fetch(`/api/plans/${id}`);
+    resp = await fetch(`/api/plans/${id}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const rec = await resp.json();
+    // 等待期间又发起了更新的打开/新建：本响应已过期，不回填、不报错
+    if (reqId !== state.solveSeq) return;
     const d = rec.plan;
     plan = {
       name: d.name,
@@ -684,12 +716,14 @@ async function loadPlan(id) {
       })),
     };
     state.planId = rec.id;
-    switchPlanContext();
     syncFormFromPlan();
     $("#planMenu").hidden = true;
     state.planMenuOpen = false;
     toast(`已打开方案「${rec.name}」`);
   } catch (e) {
+    // 过期失败响应静默丢弃；只有仍属当前打开请求的失败才提示，
+    // 且不动 plan / planId，编辑器里的原方案内容保留可继续编辑。
+    if (reqId !== state.solveSeq) return;
     toast("打开失败：" + e.message, true);
   }
 }
@@ -778,8 +812,9 @@ function init() {
     }
   });
   window.addEventListener("resize", () => {
-    // 缩放只重绘仍属于当前输入的结果；指纹不匹配时先撤下，避免新旧混绘
-    onPlanEdited();
+    // 缩放只重绘仍属于当前输入的结果；指纹不匹配时先撤下，避免新旧混绘。
+    // 注意：缩放不是编辑动作，不递增 solveSeq、不影响在途求解。
+    if (!resultStillCurrent()) invalidateResult();
     if (state.result) drawSpectrum(plan, state.result.data);
   });
 }
